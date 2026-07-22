@@ -22,7 +22,7 @@ jobs:
 
     - name: Build EXE
       run: |
-        pyinstaller --onefile --windowed --collect-all kivy --collect-all kivymd "main (1).py"
+        pyinstaller --onefile --windowed --collect-all kivy --collect-all kivymd "main.py"
 
     - name: Upload EXE
       uses: actions/upload-artifact@v4
