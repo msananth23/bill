@@ -1,0 +1,32 @@
+import os
+from kivy.lang import Builder
+from kivy.app import App
+from kivymd.uix.screen import MDScreen
+from kivymd.uix.list import TwoLineListItem
+
+Builder.load_file(os.path.join(os.path.dirname(__file__), "profiles_screen.kv"))
+
+
+class ProfilesScreen(MDScreen):
+    SCREEN_NAME = "profiles"
+
+    def on_enter(self, *args):
+        self.refresh()
+
+    def refresh(self):
+        app = App.get_running_app()
+        companies = app.local_db.list_profiles("company")
+        buyers = app.local_db.list_profiles("buyer")
+
+        c_box = self.ids.company_list
+        c_box.clear_widgets()
+        for c in companies:
+            c_box.add_widget(TwoLineListItem(text=c.get("name", ""), secondary_text=c.get("gstin", "")))
+
+        b_box = self.ids.buyer_list
+        b_box.clear_widgets()
+        for b in buyers:
+            b_box.add_widget(TwoLineListItem(text=b.get("name", ""), secondary_text=b.get("address", "")[:60]))
+
+    def go_back(self):
+        App.get_running_app().go("dashboard")

@@ -1,0 +1,116 @@
+"""
+KSMS Billing - Cross-platform client (Windows .exe via PyInstaller, Android
+.apk via Buildozer) built on KivyMD for a native look on both.
+
+Architecture:
+    main.py            <- this file: app shell, screen manager, navigation
+    core/billing_core.py<- your original GST/PDF/Excel engine (offline-capable)
+    core/local_db.py    <- offline SQLite cache (profiles, documents, outbox)
+    core/sync.py        <- talks to your VPS server when online
+    screens/*.py + *.kv <- individual screens
+
+Run on desktop for development:
+    pip install -r requirements.txt
+    python main.py
+"""
+import os
+import sys
+import uuid
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "core"))
+
+from kivy.core.window import Window
+from kivy.clock import Clock
+from kivymd.app import MDApp
+from kivymd.uix.screenmanager import MDScreenManager
+
+from local_db import LocalDB
+from sync import SyncClient
+import billing_core as core
+
+APP_VERSION = "1.0.0"
+
+
+def get_device_id(local_db: LocalDB) -> str:
+    dev_id = local_db.get_setting("device_id")
+    if not dev_id:
+        dev_id = str(uuid.uuid4())[:8]
+        local_db.set_setting("device_id", dev_id)
+    return dev_id
+
+
+class KSMSBillingApp(MDApp):
+    def build(self):
+        self.title = "KSMS Billing"
+        self.theme_cls.primary_palette = "Indigo"
+        self.theme_cls.theme_style = "Light"
+
+        # Desktop dev convenience -- ignored on Android
+        if not self.is_android():
+            Window.size = (420, 780)
+
+        db_path = os.path.join(core.APP_BASE_DIR, "local_cache.db")
+        self.local_db = LocalDB(db_path)
+        self.device_id = get_device_id(self.local_db)
+
+        server_url = self.local_db.get_setting("server_url", "")
+        api_key = self.local_db.get_setting("api_key", "")
+        self.sync_client = SyncClient(server_url, api_key, self.device_id, self.local_db)
+
+        self.sm = MDScreenManager()
+        self._build_screens()
+
+        # Try a sync shortly after launch, then periodically (e.g. every 2 min)
+        Clock.schedule_once(lambda dt: self.run_sync(), 2)
+        Clock.schedule_interval(lambda dt: self.run_sync(), 120)
+
+        return self.sm
+
+    def is_android(self):
+        try:
+            import android  # noqa: F401
+            return True
+        except ImportError:
+            return False
+
+    def _build_screens(self):
+        # Imported here (not at module top) so a missing/incomplete screen file
+        # during early development doesn't crash the whole app shell.
+        from screens.dashboard import DashboardScreen
+        from screens.document_editor import DocumentEditorScreen
+        from screens.settings_screen import SettingsScreen
+        from screens.profiles_screen import ProfilesScreen
+
+        for screen_cls in (DashboardScreen, DocumentEditorScreen, ProfilesScreen, SettingsScreen):
+            self.sm.add_widget(screen_cls(name=screen_cls.SCREEN_NAME))
+
+    def go(self, screen_name, **kwargs):
+        screen = self.sm.get_screen(screen_name)
+        if hasattr(screen, "on_enter_params"):
+            screen.on_enter_params(**kwargs)
+        self.sm.current = screen_name
+
+    def run_sync(self, on_done=None):
+        """Runs sync on a background thread so it never freezes the UI --
+        works whether the device is online or not (silently no-ops offline)."""
+        import threading
+
+        def worker():
+            try:
+                summary = self.sync_client.sync_all()
+            except Exception:
+                summary = {"online": False}
+            if on_done:
+                Clock.schedule_once(lambda dt: on_done(summary))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def reload_sync_client(self):
+        """Call after Settings screen changes the server URL / API key."""
+        server_url = self.local_db.get_setting("server_url", "")
+        api_key = self.local_db.get_setting("api_key", "")
+        self.sync_client = SyncClient(server_url, api_key, self.device_id, self.local_db)
+
+
+if __name__ == "__main__":
+    KSMSBillingApp().run()

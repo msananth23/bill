@@ -1,0 +1,131 @@
+"""
+sync.py
+=======
+Handles all communication with your VPS server (server/main.py). Designed so
+the rest of the app never has to know whether it's online or offline:
+
+  - If the server is reachable, numbering is server-authoritative (no two
+    devices ever get the same invoice/proforma/quotation number).
+  - If it's not reachable, calls silently return None and the caller
+    (billing_core.get_next_document_number) falls back to the local counter.
+  - Documents created while offline are queued in local_db's outbox and
+    confirmed/reconciled here once connectivity returns.
+
+Uses `requests` if available (desktop/Windows), and falls back to Kivy's
+UrlRequest-friendly `urllib` on Android where `requests` may not be bundled
+by default (it CAN be added as a python-for-android recipe, but urllib
+needs zero extra recipes, so it's the safer default for the APK build).
+"""
+import json
+import socket
+import urllib.request
+import urllib.error
+from local_db import LocalDB
+
+
+class SyncClient:
+    def __init__(self, server_url, api_key, device_id, local_db: LocalDB, timeout=4):
+        self.server_url = (server_url or "").rstrip("/")
+        self.api_key = api_key
+        self.device_id = device_id
+        self.db = local_db
+        self.timeout = timeout
+
+    # -- low-level HTTP helper --------------------------------------------------
+    def _request(self, method, path, payload=None, params=None):
+        if not self.server_url:
+            return None
+        url = self.server_url + path
+        if params:
+            from urllib.parse import urlencode
+            url += "?" + urlencode(params)
+        data = json.dumps(payload).encode("utf-8") if payload is not None else None
+        req = urllib.request.Request(url, data=data, method=method)
+        req.add_header("X-API-Key", self.api_key or "")
+        req.add_header("Content-Type", "application/json")
+        try:
+            with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+                return json.loads(resp.read().decode("utf-8"))
+        except (urllib.error.URLError, urllib.error.HTTPError, socket.timeout, ConnectionError, OSError):
+            return None  # offline, or server down -- caller falls back gracefully
+        except Exception:
+            return None
+
+    def is_online(self):
+        return self._request("GET", "/api/health") is not None
+
+    # -- numbering ----------------------------------------------------------
+    def reserve_number(self, company_name, doc_type):
+        """Ask the server to atomically hand out the next number. Returns
+        {'number': int, 'formatted': str, 'year_key': str} or None if offline."""
+        return self._request("POST", "/api/reserve_number", {
+            "company_name": company_name, "doc_type": doc_type, "device_id": self.device_id
+        })
+
+    # -- profiles (companies / buyers) --------------------------------------
+    def push_profile(self, kind, name, data):
+        return self._request("POST", "/api/profiles", {"kind": kind, "name": name, "data": data})
+
+    def pull_profiles(self, kind):
+        result = self._request("GET", "/api/profiles", params={"kind": kind})
+        return result["profiles"] if result else None
+
+    # -- documents ------------------------------------------------------------
+    def push_document(self, invoice_no, doc_type, company_name, data):
+        return self._request("POST", "/api/documents", {
+            "invoice_no": invoice_no, "doc_type": doc_type, "company_name": company_name,
+            "data": data, "device_id": self.device_id
+        })
+
+    def pull_documents_since(self, since_iso=None):
+        params = {"since": since_iso} if since_iso else None
+        result = self._request("GET", "/api/documents", params=params)
+        return result["documents"] if result else None
+
+    # -- full reconciliation, call this whenever connectivity is (re)detected --
+    def sync_all(self, on_progress=None):
+        """
+        Runs the full offline->online reconciliation:
+          1. Confirm any provisionally-numbered documents created offline.
+          2. Push any locally-changed profiles up.
+          3. Pull down profiles/documents changed on other devices.
+        Returns a summary dict. Safe to call repeatedly / on a timer.
+        """
+        if not self.is_online():
+            return {"online": False}
+
+        summary = {"online": True, "confirmed": 0, "renumbered": 0, "profiles_pushed": 0, "pulled_docs": 0}
+
+        # 1. Confirm provisional documents
+        for doc in self.db.get_unconfirmed_documents():
+            reserved = self.reserve_number(doc["company_name"], doc["doc_type"])
+            if reserved is None:
+                break  # went offline again mid-sync
+            if reserved["number"] != doc["provisional_number"]:
+                summary["renumbered"] += 1
+                self.db.mark_document_renumbered(doc["local_id"], reserved["number"], reserved["formatted"])
+            else:
+                summary["confirmed"] += 1
+                self.db.mark_document_confirmed(doc["local_id"])
+            if on_progress:
+                on_progress(summary)
+
+        # 2. Push dirty profiles
+        for kind, name, data in self.db.get_dirty_profiles():
+            if self.push_profile(kind, name, data):
+                summary["profiles_pushed"] += 1
+                self.db.mark_profile_clean(kind, name)
+
+        # 3. Pull remote changes down
+        for kind in ("company", "buyer"):
+            remote = self.pull_profiles(kind)
+            if remote:
+                self.db.merge_remote_profiles(kind, remote)
+
+        docs = self.pull_documents_since(self.db.get_last_doc_sync_time())
+        if docs:
+            self.db.merge_remote_documents(docs)
+            summary["pulled_docs"] = len(docs)
+            self.db.set_last_doc_sync_time_now()
+
+        return summary

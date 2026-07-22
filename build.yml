@@ -1,0 +1,26 @@
+import os
+from kivy.lang import Builder
+from kivy.app import App
+from kivymd.uix.screen import MDScreen
+
+Builder.load_file(os.path.join(os.path.dirname(__file__), "settings_screen.kv"))
+
+
+class SettingsScreen(MDScreen):
+    SCREEN_NAME = "settings"
+
+    def on_enter(self, *args):
+        app = App.get_running_app()
+        self.ids.server_url.text = app.local_db.get_setting("server_url", "")
+        self.ids.api_key.text = app.local_db.get_setting("api_key", "")
+
+    def save(self):
+        app = App.get_running_app()
+        app.local_db.set_setting("server_url", self.ids.server_url.text.strip())
+        app.local_db.set_setting("api_key", self.ids.api_key.text.strip())
+        app.reload_sync_client()
+        app.run_sync()
+        app.go("dashboard")
+
+    def go_back(self):
+        App.get_running_app().go("dashboard")

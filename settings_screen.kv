@@ -1,0 +1,168 @@
+"""
+local_db.py
+===========
+Offline-first local storage. Every screen in the app reads/writes here
+FIRST -- the server is only consulted opportunistically by sync.py. This is
+what makes "works offline or online" actually true: the app never blocks
+on a network call for normal use, it just queues sync work.
+
+Tables:
+  companies / buyers   -- profile cache, mirrors server, plus a 'dirty' flag
+                           for local edits that still need pushing
+  documents            -- every invoice/proforma/quotation created on this
+                           device, with its provisional/confirmed number
+  meta                 -- small key/value store (last sync timestamps etc.)
+"""
+import sqlite3
+import json
+from datetime import datetime
+
+
+class LocalDB:
+    def __init__(self, db_path):
+        self.db_path = db_path
+        self.conn = sqlite3.connect(db_path)
+        self.conn.row_factory = sqlite3.Row
+        self._init_schema()
+
+    def _init_schema(self):
+        c = self.conn
+        c.execute("""CREATE TABLE IF NOT EXISTS profiles (
+            kind TEXT NOT NULL,
+            name_key TEXT NOT NULL,
+            data_json TEXT NOT NULL,
+            dirty INTEGER NOT NULL DEFAULT 0,
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY (kind, name_key)
+        )""")
+        c.execute("""CREATE TABLE IF NOT EXISTS documents (
+            local_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            doc_type TEXT NOT NULL,
+            company_name TEXT NOT NULL,
+            provisional_number INTEGER,
+            confirmed_number INTEGER,
+            formatted_invoice_no TEXT NOT NULL,
+            confirmed INTEGER NOT NULL DEFAULT 0,
+            data_json TEXT NOT NULL,
+            pdf_path TEXT,
+            xlsx_path TEXT,
+            created_at TEXT NOT NULL
+        )""")
+        c.execute("""CREATE TABLE IF NOT EXISTS meta (
+            key TEXT PRIMARY KEY, value TEXT
+        )""")
+        c.commit()
+
+    # -- profiles -------------------------------------------------------------
+    def upsert_profile_local(self, kind, name, data, mark_dirty=True):
+        key = name.strip().lower()
+        self.conn.execute(
+            """INSERT INTO profiles (kind, name_key, data_json, dirty, updated_at) VALUES (?,?,?,?,?)
+               ON CONFLICT(kind, name_key) DO UPDATE SET data_json=excluded.data_json,
+               dirty=excluded.dirty, updated_at=excluded.updated_at""",
+            (kind, key, json.dumps(data), 1 if mark_dirty else 0, datetime.utcnow().isoformat()),
+        )
+        self.conn.commit()
+
+    def list_profiles(self, kind):
+        rows = self.conn.execute("SELECT data_json FROM profiles WHERE kind=? ORDER BY name_key", (kind,)).fetchall()
+        return [json.loads(r["data_json"]) for r in rows]
+
+    def get_dirty_profiles(self):
+        rows = self.conn.execute("SELECT kind, name_key, data_json FROM profiles WHERE dirty=1").fetchall()
+        return [(r["kind"], json.loads(r["data_json"]).get("name", r["name_key"]), json.loads(r["data_json"])) for r in rows]
+
+    def mark_profile_clean(self, kind, name):
+        key = name.strip().lower()
+        self.conn.execute("UPDATE profiles SET dirty=0 WHERE kind=? AND name_key=?", (kind, key))
+        self.conn.commit()
+
+    def merge_remote_profiles(self, kind, remote_list):
+        """Last-write-wins merge: only overwrite local rows that aren't dirty
+        (i.e. don't clobber an unsynced local edit with an older remote copy)."""
+        for data in remote_list:
+            name = data.get("name", "")
+            key = name.strip().lower()
+            row = self.conn.execute("SELECT dirty FROM profiles WHERE kind=? AND name_key=?", (kind, key)).fetchone()
+            if row and row["dirty"]:
+                continue
+            self.upsert_profile_local(kind, name, data, mark_dirty=False)
+
+    # -- documents --------------------------------------------------------------
+    def save_document(self, doc_type, company_name, provisional_number, formatted_invoice_no,
+                       confirmed, data, pdf_path=None, xlsx_path=None):
+        cur = self.conn.execute(
+            """INSERT INTO documents (doc_type, company_name, provisional_number, confirmed_number,
+               formatted_invoice_no, confirmed, data_json, pdf_path, xlsx_path, created_at)
+               VALUES (?,?,?,?,?,?,?,?,?,?)""",
+            (doc_type, company_name, provisional_number, provisional_number if confirmed else None,
+             formatted_invoice_no, 1 if confirmed else 0, json.dumps(data), pdf_path, xlsx_path,
+             datetime.utcnow().isoformat()),
+        )
+        self.conn.commit()
+        return cur.lastrowid
+
+    def get_unconfirmed_documents(self):
+        rows = self.conn.execute("SELECT * FROM documents WHERE confirmed=0").fetchall()
+        return [{"local_id": r["local_id"], "doc_type": r["doc_type"], "company_name": r["company_name"],
+                 "provisional_number": r["provisional_number"], "formatted_invoice_no": r["formatted_invoice_no"],
+                 "data": json.loads(r["data_json"])} for r in rows]
+
+    def mark_document_confirmed(self, local_id):
+        self.conn.execute("UPDATE documents SET confirmed=1, confirmed_number=provisional_number WHERE local_id=?", (local_id,))
+        self.conn.commit()
+
+    def mark_document_renumbered(self, local_id, new_number, new_formatted):
+        """Called when the server had to reassign a number because another
+        device already used the one this device picked while offline.
+        Flags the row so the UI can prompt the user to regenerate the
+        PDF/Excel under the corrected number/filename."""
+        self.conn.execute(
+            "UPDATE documents SET confirmed=1, confirmed_number=?, formatted_invoice_no=? WHERE local_id=?",
+            (new_number, new_formatted, local_id),
+        )
+        self.conn.commit()
+
+    def needs_regeneration(self):
+        """Documents whose number changed after the fact -- their already-written
+        PDF/Excel files no longer match formatted_invoice_no and should be
+        regenerated with the corrected number."""
+        rows = self.conn.execute(
+            "SELECT local_id, formatted_invoice_no, doc_type FROM documents WHERE confirmed=1 AND confirmed_number IS NOT provisional_number"
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def merge_remote_documents(self, remote_docs):
+        # Cross-device visibility only (for lookups); local generation records stay authoritative locally.
+        for d in remote_docs:
+            existing = self.conn.execute(
+                "SELECT local_id FROM documents WHERE formatted_invoice_no=?", (d["invoice_no"],)
+            ).fetchone()
+            if not existing:
+                self.conn.execute(
+                    """INSERT INTO documents (doc_type, company_name, provisional_number, confirmed_number,
+                       formatted_invoice_no, confirmed, data_json, created_at) VALUES (?,?,?,?,?,?,?,?)""",
+                    (d["doc_type"], d["data"].get("company_info", {}).get("name", ""), None, None,
+                     d["invoice_no"], 1, json.dumps(d["data"]), d["updated_at"]),
+                )
+        self.conn.commit()
+
+    # -- meta / sync bookkeeping -------------------------------------------------
+    def get_last_doc_sync_time(self):
+        row = self.conn.execute("SELECT value FROM meta WHERE key='last_doc_sync'").fetchone()
+        return row["value"] if row else None
+
+    def set_last_doc_sync_time_now(self):
+        now = datetime.utcnow().isoformat()
+        self.conn.execute("INSERT INTO meta (key, value) VALUES ('last_doc_sync', ?) "
+                           "ON CONFLICT(key) DO UPDATE SET value=excluded.value", (now,))
+        self.conn.commit()
+
+    def get_setting(self, key, default=None):
+        row = self.conn.execute("SELECT value FROM meta WHERE key=?", (key,)).fetchone()
+        return row["value"] if row else default
+
+    def set_setting(self, key, value):
+        self.conn.execute("INSERT INTO meta (key, value) VALUES (?, ?) "
+                           "ON CONFLICT(key) DO UPDATE SET value=excluded.value", (key, value))
+        self.conn.commit()
