@@ -1,0 +1,40 @@
+name: Build EXE and APK
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build-exe:
+    runs-on: windows-latest
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Setup Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.11'
+
+    - name: Install dependencies
+      run: |
+        pip install pyinstaller
+
+    - name: Build EXE
+      run: |
+        pyinstaller --onefile --windowed client/main.py
+
+    - name: Upload EXE
+      uses: actions/upload-artifact@v4
+      with:
+        name: KSMSBilling-EXE
+        path: dist/*
+
+  build-apk:
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Build APK
+      run: |
+        echo "APK build placeholder"
